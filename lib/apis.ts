@@ -5,7 +5,7 @@ const USDA_BASE = "https://api.nal.usda.gov/fdc/v1";
 const USDA_KEY = "DEMO_KEY"; // swap for a free key at fdc.nal.usda.gov
 
 // Set your Groq API key here or in a config file
-export const GROQ_API_KEY = ""; // <-- paste your key from console.groq.com
+export const GROQ_API_KEY = process.env.EXPO_PUBLIC_GROQ_API_KEY ?? "";
 const GROQ_BASE = "https://api.groq.com/openai/v1";
 
 export interface VisionResult {
