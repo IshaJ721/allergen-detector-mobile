@@ -1,9 +1,10 @@
-import React, { useState } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import {
   ActivityIndicator,
   Alert,
   Image,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -16,6 +17,7 @@ import {
 import { StatusBar } from "expo-status-bar";
 import * as ImagePicker from "expo-image-picker";
 import { readAsStringAsync, EncodingType } from "expo-file-system/legacy";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { DEFAULT_ALLERGENS, Allergen } from "./lib/allergens";
 import { scoreAllergen } from "./lib/scoring";
 import {
@@ -41,6 +43,23 @@ interface AnalysisResult {
   allergens: Record<string, AllergenResult>;
 }
 
+interface HistoryEntry {
+  id: string;
+  timestamp: number;
+  imageUri: string;
+  result: AnalysisResult;
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const STORAGE_KEYS = {
+  ALLERGEN_SELECTIONS: "allergen_selections_v1",
+  CUSTOM_ALLERGENS: "custom_allergens_v1",
+  SCAN_HISTORY: "scan_history_v1",
+};
+const MAX_HISTORY = 10;
+const RISK_ORDER: Record<string, number> = { High: 0, Likely: 1, Possible: 2, Low: 3 };
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function riskColors(risk: string) {
@@ -50,6 +69,20 @@ function riskColors(risk: string) {
     case "Possible": return { bar: "#eab308", badge: "#fef9c3", text: "#a16207", border: "#fde047" };
     default:         return { bar: "#22c55e", badge: "#dcfce7", text: "#15803d", border: "#86efac" };
   }
+}
+
+function formatDate(ts: number): string {
+  const d = new Date(ts);
+  return d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) +
+    " " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+function topRisk(allergens: Record<string, AllergenResult>): string {
+  let best = "Low";
+  for (const v of Object.values(allergens)) {
+    if (RISK_ORDER[v.risk] < RISK_ORDER[best]) best = v.risk;
+  }
+  return best;
 }
 
 // ─── Allergen Card ────────────────────────────────────────────────────────────
@@ -82,6 +115,80 @@ function AllergenCard({
   );
 }
 
+// ─── History Item ─────────────────────────────────────────────────────────────
+
+function HistoryItem({
+  entry,
+  onPress,
+}: {
+  entry: HistoryEntry;
+  onPress: () => void;
+}) {
+  const risk = topRisk(entry.result.allergens);
+  const c = riskColors(risk);
+  return (
+    <TouchableOpacity style={styles.historyItem} onPress={onPress} activeOpacity={0.7}>
+      <Image source={{ uri: entry.imageUri }} style={styles.historyThumb} />
+      <View style={styles.historyInfo}>
+        <Text style={styles.historyDish} numberOfLines={1}>{entry.result.dish}</Text>
+        <Text style={styles.historyTime}>{formatDate(entry.timestamp)}</Text>
+      </View>
+      <View style={[styles.badge, { backgroundColor: c.badge, borderColor: c.border, alignSelf: "center" }]}>
+        <Text style={[styles.badgeText, { color: c.text }]}>{risk}</Text>
+      </View>
+    </TouchableOpacity>
+  );
+}
+
+// ─── History Modal ────────────────────────────────────────────────────────────
+
+function HistoryModal({
+  visible,
+  history,
+  onClose,
+  onSelect,
+  onClear,
+}: {
+  visible: boolean;
+  history: HistoryEntry[];
+  onClose: () => void;
+  onSelect: (entry: HistoryEntry) => void;
+  onClear: () => void;
+}) {
+  return (
+    <Modal visible={visible} animationType="slide" presentationStyle="pageSheet">
+      <View style={styles.modalContainer}>
+        <View style={styles.modalHeader}>
+          <Text style={styles.modalTitle}>Scan History</Text>
+          <View style={{ flexDirection: "row", gap: 12 }}>
+            {history.length > 0 && (
+              <TouchableOpacity onPress={onClear}>
+                <Text style={styles.clearBtn}>Clear</Text>
+              </TouchableOpacity>
+            )}
+            <TouchableOpacity onPress={onClose}>
+              <Text style={styles.doneBtn}>Done</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+        <ScrollView contentContainerStyle={{ padding: 16 }}>
+          {history.length === 0 ? (
+            <Text style={styles.emptyHistory}>No scans yet. Analyze a food photo to get started.</Text>
+          ) : (
+            history.map((entry) => (
+              <HistoryItem
+                key={entry.id}
+                entry={entry}
+                onPress={() => { onSelect(entry); onClose(); }}
+              />
+            ))
+          )}
+        </ScrollView>
+      </View>
+    </Modal>
+  );
+}
+
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -103,6 +210,45 @@ export default function App() {
 
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [loading, setLoading] = useState(false);
+
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+
+  // ── Persist & restore allergen prefs ──
+  useEffect(() => {
+    (async () => {
+      try {
+        const [savedSelections, savedCustom, savedHistory] = await Promise.all([
+          AsyncStorage.getItem(STORAGE_KEYS.ALLERGEN_SELECTIONS),
+          AsyncStorage.getItem(STORAGE_KEYS.CUSTOM_ALLERGENS),
+          AsyncStorage.getItem(STORAGE_KEYS.SCAN_HISTORY),
+        ]);
+        if (savedSelections) setSelectedAllergens(new Set(JSON.parse(savedSelections)));
+        if (savedCustom) setCustomAllergens(JSON.parse(savedCustom));
+        if (savedHistory) setHistory(JSON.parse(savedHistory));
+      } catch {
+        // ignore storage errors
+      }
+    })();
+  }, []);
+
+  const saveAllergenSelections = useCallback(async (selections: Set<string>) => {
+    try {
+      await AsyncStorage.setItem(STORAGE_KEYS.ALLERGEN_SELECTIONS, JSON.stringify([...selections]));
+    } catch {}
+  }, []);
+
+  const saveCustomAllergens = useCallback(async (customs: { name: string; keywords: string[] }[]) => {
+    try {
+      await AsyncStorage.setItem(STORAGE_KEYS.CUSTOM_ALLERGENS, JSON.stringify(customs));
+    } catch {}
+  }, []);
+
+  const saveHistory = useCallback(async (entries: HistoryEntry[]) => {
+    try {
+      await AsyncStorage.setItem(STORAGE_KEYS.SCAN_HISTORY, JSON.stringify(entries));
+    } catch {}
+  }, []);
 
   // ── Image picker ──
   const pickImage = async () => {
@@ -141,6 +287,7 @@ export default function App() {
     setSelectedAllergens((prev) => {
       const next = new Set(prev);
       next.has(id) ? next.delete(id) : next.add(id);
+      saveAllergenSelections(next);
       return next;
     });
   };
@@ -149,12 +296,24 @@ export default function App() {
     const name = newName.trim();
     if (!name) return;
     const keywords = newKeywords.split(",").map((k) => k.trim()).filter(Boolean);
-    setCustomAllergens((prev) => [
-      ...prev,
-      { name, keywords: keywords.length ? keywords : [name.toLowerCase()] },
-    ]);
+    setCustomAllergens((prev) => {
+      const next = [
+        ...prev,
+        { name, keywords: keywords.length ? keywords : [name.toLowerCase()] },
+      ];
+      saveCustomAllergens(next);
+      return next;
+    });
     setNewName("");
     setNewKeywords("");
+  };
+
+  const removeCustomAllergen = (index: number) => {
+    setCustomAllergens((prev) => {
+      const next = prev.filter((_, j) => j !== index);
+      saveCustomAllergens(next);
+      return next;
+    });
   };
 
   // ── Analyze ──
@@ -215,14 +374,31 @@ export default function App() {
         });
       }
 
-      setResult({
+      const newResult: AnalysisResult = {
         dish: resolvedDish,
         visionConfidence: visionResult.visionConfidence,
         visibleIngredients: visionResult.visibleIngredients,
         uncertaintyNotes: visionResult.uncertaintyNotes,
         ingredients: allIngredients,
         allergens: allergenResults,
-      });
+      };
+
+      setResult(newResult);
+
+      // Save to history
+      if (imageUri) {
+        const entry: HistoryEntry = {
+          id: Date.now().toString(),
+          timestamp: Date.now(),
+          imageUri,
+          result: newResult,
+        };
+        setHistory((prev) => {
+          const next = [entry, ...prev].slice(0, MAX_HISTORY);
+          saveHistory(next);
+          return next;
+        });
+      }
     } catch (err) {
       Alert.alert("Error", err instanceof Error ? err.message : "Something went wrong");
     } finally {
@@ -230,6 +406,27 @@ export default function App() {
     }
   };
 
+  const loadHistoryEntry = (entry: HistoryEntry) => {
+    setImageUri(entry.imageUri);
+    setResult(entry.result);
+    setDishName(entry.result.dish);
+  };
+
+  const clearHistory = () => {
+    Alert.alert("Clear History", "Remove all saved scans?", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Clear",
+        style: "destructive",
+        onPress: () => {
+          setHistory([]);
+          saveHistory([]);
+        },
+      },
+    ]);
+  };
+
+  // Sort allergens for display: High → Likely → Possible → Low
   const displayAllergens: Allergen[] = [
     ...DEFAULT_ALLERGENS.filter((a) => selectedAllergens.has(a.id)),
     ...customAllergens.map((ca, i) => ({
@@ -239,6 +436,14 @@ export default function App() {
       custom: true,
     })),
   ];
+
+  const sortedDisplayAllergens = result
+    ? [...displayAllergens].sort((a, b) => {
+        const ra = result.allergens[a.id]?.risk ?? "Low";
+        const rb = result.allergens[b.id]?.risk ?? "Low";
+        return (RISK_ORDER[ra] ?? 3) - (RISK_ORDER[rb] ?? 3);
+      })
+    : displayAllergens;
 
   return (
     <KeyboardAvoidingView
@@ -253,7 +458,17 @@ export default function App() {
       >
         {/* Header */}
         <View style={styles.header}>
-          <Text style={styles.title}>Food Allergen Detector</Text>
+          <View style={styles.headerRow}>
+            <Text style={styles.title}>Food Allergen Detector</Text>
+            <TouchableOpacity style={styles.historyBtn} onPress={() => setShowHistory(true)}>
+              <Text style={styles.historyBtnText}>History</Text>
+              {history.length > 0 && (
+                <View style={styles.historyBadge}>
+                  <Text style={styles.historyBadgeText}>{history.length}</Text>
+                </View>
+              )}
+            </TouchableOpacity>
+          </View>
           <Text style={styles.subtitle}>
             Upload a photo to estimate allergen risks using AI + recipe data
           </Text>
@@ -358,11 +573,7 @@ export default function App() {
               {customAllergens.map((ca, i) => (
                 <View key={i} style={styles.customPill}>
                   <Text style={styles.customPillText}>{ca.name}</Text>
-                  <Pressable
-                    onPress={() =>
-                      setCustomAllergens((p) => p.filter((_, j) => j !== i))
-                    }
-                  >
+                  <Pressable onPress={() => removeCustomAllergen(i)}>
                     <Text style={styles.removePill}>  ×</Text>
                   </Pressable>
                 </View>
@@ -425,7 +636,7 @@ export default function App() {
             <Text style={[styles.sectionTitle, { marginBottom: 8 }]}>
               Allergen Risk Assessment
             </Text>
-            {displayAllergens.map((a) => {
+            {sortedDisplayAllergens.map((a) => {
               const data = result.allergens[a.id];
               if (!data) return null;
               return (
@@ -448,6 +659,15 @@ export default function App() {
           </View>
         )}
       </ScrollView>
+
+      {/* History Modal */}
+      <HistoryModal
+        visible={showHistory}
+        history={history}
+        onClose={() => setShowHistory(false)}
+        onSelect={loadHistoryEntry}
+        onClear={clearHistory}
+      />
     </KeyboardAvoidingView>
   );
 }
@@ -458,9 +678,33 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#f8fafc" },
   content: { padding: 20, paddingTop: 64, paddingBottom: 48 },
 
-  header: { marginBottom: 24, alignItems: "center" },
-  title: { fontSize: 26, fontWeight: "700", color: "#0f172a", textAlign: "center" },
-  subtitle: { fontSize: 13, color: "#64748b", marginTop: 6, textAlign: "center", lineHeight: 19 },
+  header: { marginBottom: 24 },
+  headerRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  title: { fontSize: 24, fontWeight: "700", color: "#0f172a", flex: 1 },
+  subtitle: { fontSize: 13, color: "#64748b", marginTop: 6, lineHeight: 19 },
+
+  historyBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#f1f5f9",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+    gap: 6,
+  },
+  historyBtnText: { fontSize: 13, fontWeight: "600", color: "#374151" },
+  historyBadge: {
+    backgroundColor: "#2563eb",
+    borderRadius: 10,
+    minWidth: 18,
+    height: 18,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 4,
+  },
+  historyBadgeText: { fontSize: 10, color: "#fff", fontWeight: "700" },
 
   section: {
     backgroundColor: "#fff",
@@ -630,4 +874,46 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   disclaimerText: { fontSize: 11, color: "#64748b", textAlign: "center", lineHeight: 16 },
+
+  // History modal
+  modalContainer: { flex: 1, backgroundColor: "#f8fafc" },
+  modalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: 20,
+    paddingTop: 24,
+    borderBottomWidth: 1,
+    borderBottomColor: "#e2e8f0",
+    backgroundColor: "#fff",
+  },
+  modalTitle: { fontSize: 18, fontWeight: "700", color: "#0f172a" },
+  doneBtn: { fontSize: 15, color: "#2563eb", fontWeight: "600" },
+  clearBtn: { fontSize: 15, color: "#ef4444", fontWeight: "500" },
+
+  historyItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#fff",
+    borderRadius: 14,
+    padding: 12,
+    marginBottom: 10,
+    shadowColor: "#000",
+    shadowOpacity: 0.04,
+    shadowRadius: 6,
+    shadowOffset: { width: 0, height: 1 },
+    elevation: 1,
+    gap: 12,
+  },
+  historyThumb: { width: 56, height: 56, borderRadius: 10 },
+  historyInfo: { flex: 1 },
+  historyDish: { fontSize: 14, fontWeight: "600", color: "#1e293b" },
+  historyTime: { fontSize: 12, color: "#94a3b8", marginTop: 2 },
+  emptyHistory: {
+    textAlign: "center",
+    color: "#94a3b8",
+    fontSize: 14,
+    marginTop: 60,
+    lineHeight: 22,
+  },
 });
